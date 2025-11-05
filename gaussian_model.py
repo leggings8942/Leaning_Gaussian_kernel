@@ -1,5 +1,6 @@
 from abc import ABCMeta, abstractmethod
 from typing import List, Tuple
+from functools import reduce
 import numpy as np
 import scipy as sp
 from scipy.linalg import solve_triangular
@@ -20,6 +21,10 @@ def modified_cholesky(x:np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         print(f"x shape = {x.shape}")
         raise ValueError("エラー：：正方行列ではありません。")
     
+    if not np.allclose(x, x.T, atol=1e-10):
+        # 対称性をチェック
+        raise ValueError("エラー：：対称行列ではありません。")
+    
     n = x.shape[0]
     d = np.diag(x).copy()
     L = np.tril(x, k=-1).copy() + np.identity(n)
@@ -33,17 +38,45 @@ def modified_cholesky(x:np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         L[idx1:, prev] = (L[idx1:, prev] - tmp) / DIV
         d[idx1]       -= np.sum((L[idx1, 0:idx1] ** 2) * d[0:idx1])
     
-    d = np.diag(d)
+    # d = np.diag(d)
     return L, d
+
+# 修正コレスキー分解による連立方程式のソルバー
+def modcho_solve(A:np.ndarray, b:np.ndarray):
+    L, d = modified_cholesky(A)
+    z = solve_triangular(L,   b, lower=True,  unit_diagonal=True)
+    w = z / d[:, np.newaxis]
+    x = solve_triangular(L.T, w, lower=False, unit_diagonal=True)
+    return x
 
 # 軟判別閾値関数
 def soft_threshold(x:np.ndarray, α:float) -> np.ndarray:
     return np.sign(x) * np.maximum(np.abs(x) - α, 0)
 
+# 対数尤度関数の微分量を返す関数
+def diff_log_likelihood(K:np.ndarray, y:np.ndarray, dKθ:Tuple[np.ndarray]) -> np.ndarray:
+    K_inv  = np.linalg.inv(K)
+    solv_x = K_inv @ y
+    ΔDiff  = tuple(-np.trace(K_inv @ diff_θ) + solv_x.T @ diff_θ @ solv_x for diff_θ in dKθ)
+    ΔDiff  = tuple(diff_θ.item() for diff_θ in ΔDiff)
+    return ΔDiff
+
 # 相関係数カーネルのインターフェース
 class Kernel(metaclass=ABCMeta):
     @abstractmethod
     def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def diff_theta(self) -> Tuple:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        raise NotImplementedError()
+    
+    @abstractmethod
+    def get_theta(self) -> Tuple:
         raise NotImplementedError()
 
     @abstractmethod
@@ -52,9 +85,12 @@ class Kernel(metaclass=ABCMeta):
 
 # 定数カーネル
 class ConstantKernel(Kernel):
-    def __init__(self, alpha:float):
+    def __init__(self, alpha:float, isL1Reg:bool=True, isL2Reg:bool=True):
         super().__init__()
-        self.alpha = alpha
+        self.alpha    = alpha
+        self.isL1Reg  = isL1Reg
+        self.isL2Reg  = isL2Reg
+        self.cache    = np.zeros([1, 1])
         return None
 
     def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
@@ -76,9 +112,32 @@ class ConstantKernel(Kernel):
             raise ValueError("エラー：：対称行列ではありません。")
         
         if type(DATA_Y) == type(None):
-            return np.full_like(DATA_X, self.alpha)
+            self.cache = np.full_like(np.empty((DATA_X.shape[0], DATA_X.shape[0])), 1.0)
         else:
-            return np.full_like(np.empty((DATA_X.shape[0], DATA_Y.shape[0])), self.alpha)
+            self.cache = np.full_like(np.empty((DATA_X.shape[0], DATA_Y.shape[0])), 1.0)
+        
+        return self.alpha * self.cache
+
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache
+        return (diff_alpha,)
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+        else:
+            Δalpha = self.alpha + eta * Δtheta[0]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta * l2_norm)
+        
+        self.alpha = Δalpha
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha,)
 
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -89,8 +148,10 @@ class ConstantKernel(Kernel):
 class SumKernel(Kernel):
     def __init__(self, left:Kernel, right:Kernel) -> None:
         super().__init__()
-        self.left  = left
-        self.right = right
+
+        self.kernels = ()
+        self.kernels += left.kernels  if isinstance(left,  SumKernel) else (left,)
+        self.kernels += right.kernels if isinstance(right, SumKernel) else (right,)
         return None
     
     def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
@@ -111,7 +172,25 @@ class SumKernel(Kernel):
             print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
             raise ValueError("エラー：：対称行列ではありません。")
 
-        return self.left.correlation(DATA_X, DATA_Y) + self.right.correlation(DATA_X, DATA_Y)
+        return np.sum([elem.correlation(DATA_X, DATA_Y) for elem in self.kernels], axis=0)
+    
+    def diff_theta(self) -> Tuple:
+        diff_tuple = reduce(lambda x, y: x + y, [elem.diff_theta() for elem in self.kernels])
+        return diff_tuple
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # それぞれの枝における葉ノードのハイパーパラメータの数が不明であるため
+        # これの探索を行う
+        tmp_tuple = Δtheta
+        for elem in self.kernels:
+            theta_num = len(elem.get_theta())
+            elem.update_theta(tmp_tuple[0:theta_num], eta=eta, l1_norm=l1_norm, l2_norm=l2_norm)
+            tmp_tuple = tmp_tuple[theta_num:]
+        return True
+    
+    def get_theta(self) -> Tuple:
+        theta_tuple = reduce(lambda x, y: x + y, [elem.get_theta() for elem in self.kernels])
+        return theta_tuple
 
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -123,6 +202,7 @@ class WhiteNoiseKernel(Kernel):
     def __init__(self, alpha:float):
         super().__init__()
         self.alpha = alpha
+        self.cache = np.zeros([1, 1])
         return None
     
     def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
@@ -142,128 +222,38 @@ class WhiteNoiseKernel(Kernel):
             print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
             print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
             raise ValueError("エラー：：対称行列ではありません。")
-    
+
+        # メモ：
+        # ホワイトノイズカーネルのハイパーパラメータだけは0にも負にもなってはいけない
+        # それは、誤差量が0以下である事を表現することに他ならないためである
+        # 必ず、正の誤差量が存在するようにしなければならない
+        # このことからy=1/2 x^2という変数変換を施す事とした
+        tmp_alpha = (self.alpha ** 2) / 2
+
         # クロネッカーのデルタを適用する
         if type(DATA_Y) == type(None):
-            return self.alpha * np.eye(DATA_X.shape[0])
+            self.cache = np.eye(DATA_X.shape[0])
         else:
-            return np.zeros((DATA_X.shape[0], DATA_Y.shape[0]))
-    
-    def __add__(self, other):
-        if not isinstance(other, Kernel):
-            other = ConstantKernel(other)
-        return SumKernel(self, other)
-
-# 線形カーネル
-class LinearKernel(Kernel):
-    def __init__(self, alpha:float):
-        super().__init__()
-        self.alpha = alpha
-        return None
-
-    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
-        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
-            print(f"type(DATA_X) = {type(DATA_X)}")
-            print(f"type(DATA_Y) = {type(DATA_Y)}")
-            print("エラー：：Numpy型である必要があります。")
-            raise
-
-        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
-            print(f"DATA_X.ndim = {DATA_X.ndim}")
-            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
-            raise ValueError("エラー：：次元数が一致しません。")
+            self.cache = np.zeros((DATA_X.shape[0], DATA_Y.shape[0]))
         
-        # 対称行列であるか判定
-        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
-            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
-            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
-            raise ValueError("エラー：：対称行列ではありません。")
+        return tmp_alpha * self.cache
     
-        # 内積を計算する
-        if type(DATA_Y) == type(None):
-            K = DATA_X @ DATA_X.T
-        else:
-            K = DATA_X @ DATA_Y.T
-        return self.alpha * K
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache * self.alpha
+        return (diff_alpha,)
     
-    def __add__(self, other):
-        if not isinstance(other, Kernel):
-            other = ConstantKernel(other)
-        return SumKernel(self, other)
-
-# 指数カーネル
-class ExponentialKernel(Kernel):
-    def __init__(self, alpha:float, beta:float):
-        super().__init__()
-        self.alpha = alpha
-        self.beta  = beta
-        return None
-
-    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
-        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
-            print(f"type(DATA_X) = {type(DATA_X)}")
-            print(f"type(DATA_Y) = {type(DATA_Y)}")
-            print("エラー：：Numpy型である必要があります。")
-            raise
-
-        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
-            print(f"DATA_X.ndim = {DATA_X.ndim}")
-            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
-            raise ValueError("エラー：：次元数が一致しません。")
-        
-        # 対称行列であるか判定
-        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
-            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
-            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
-            raise ValueError("エラー：：対称行列ではありません。")
-
-        if type(DATA_Y) == type(None):
-            K = spd.squareform(spd.pdist(DATA_X, metric="cityblock"))
-            K = np.exp(K / self.alpha)
-        else:
-            K = spd.cdist(DATA_X, DATA_Y, metric="cityblock")
-            K = np.exp(K / self.alpha)
-        return self.beta * K
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:        
+        self.alpha = self.alpha + eta * Δtheta[0]
+        return True
     
-    def __add__(self, other):
-        if not isinstance(other, Kernel):
-            other = ConstantKernel(other)
-        return SumKernel(self, other)
-
-# 周期カーネル
-class PeriodicKernel(Kernel):
-    def __init__(self, alpha:float, beta:float, gamma:float):
-        super().__init__()
-        self.alpha = alpha
-        self.beta  = beta
-        self.gamma = gamma
-        return None
-
-    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
-        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
-            print(f"type(DATA_X) = {type(DATA_X)}")
-            print(f"type(DATA_Y) = {type(DATA_Y)}")
-            print("エラー：：Numpy型である必要があります。")
-            raise
-
-        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
-            print(f"DATA_X.ndim = {DATA_X.ndim}")
-            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
-            raise ValueError("エラー：：次元数が一致しません。")
-        
-        # 対称行列であるか判定
-        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
-            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
-            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
-            raise ValueError("エラー：：対称行列ではありません。")
-
-        if type(DATA_Y) == type(None):
-            K = spd.squareform(spd.pdist(DATA_X, metric="cityblock"))
-            K = np.exp(self.beta * np.cos(K / self.alpha))
-        else:
-            K = spd.cdist(DATA_X, DATA_Y, metric="cityblock")
-            K = np.exp(self.beta * np.cos(K / self.alpha))
-        return self.gamma * K
+    def get_theta(self) -> Tuple:
+        # メモ：
+        # ホワイトノイズカーネルのハイパーパラメータだけは0にも負にもなってはいけない
+        # それは、誤差量が0以下である事を表現することに他ならないためである
+        # 必ず、正の誤差量が存在するようにしなければならない
+        # このことからy=1/2 x^2という変数変換を施す事とした
+        tmp_alpha = (self.alpha ** 2) / 2
+        return (tmp_alpha,)
     
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -272,10 +262,15 @@ class PeriodicKernel(Kernel):
 
 # ガウスカーネル(RBFカーネル)
 class GaussKernel(Kernel):
-    def __init__(self, alpha:float, beta:float):
+    def __init__(self, alpha:float, beta:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
         super().__init__()
-        self.alpha = alpha
-        self.beta  = beta
+        self.alpha     = alpha
+        self.beta      = beta
+        self.isL1Reg   = isL1Reg
+        self.isL2Reg   = isL2Reg
+        self.isNonNeg  = isNonNeg
+        self.cache_mol = np.zeros([1, 1])
+        self.cache_cor = np.zeros([1, 1])
         return None
 
     def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
@@ -297,12 +292,266 @@ class GaussKernel(Kernel):
             raise ValueError("エラー：：対称行列ではありません。")
 
         if type(DATA_Y) == type(None):
-            K = spd.squareform(spd.pdist(DATA_X, metric="sqeuclidean"))
-            K = np.exp(-K / self.alpha)
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="sqeuclidean")) / self.beta
+            self.cache_cor = np.exp(-self.cache_mol)
         else:
-            K = spd.cdist(DATA_X, DATA_Y, metric="sqeuclidean")
-            K = np.exp(-K / self.alpha)
-        return self.beta * K
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="sqeuclidean") / self.beta
+            self.cache_cor = np.exp(-self.cache_mol)
+        
+        return (self.alpha * self.cache_cor)
+    
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache_cor
+        diff_beta  = self.alpha * self.cache_cor * self.cache_mol / self.beta
+        return (diff_alpha, diff_beta)
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
+        else:
+            Δalpha = self.alpha + eta * Δtheta[0]
+            Δbeta  = self.beta  + eta * Δtheta[1]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
+            Δbeta  = np.maximum(Δbeta,  0)
+        
+        self.alpha = Δalpha
+        self.beta  = Δbeta
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha, self.beta)
+    
+    def __add__(self, other):
+        if not isinstance(other, Kernel):
+            other = ConstantKernel(other)
+        return SumKernel(self, other)
+
+class LinearKernel(Kernel):
+    def __init__(self, alpha:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
+        super().__init__()
+        self.alpha     = alpha
+        self.isL1Reg   = isL1Reg
+        self.isL2Reg   = isL2Reg
+        self.isNonNeg  = isNonNeg
+        self.cache     = np.zeros([1, 1])
+        return None
+
+    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
+        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
+            print(f"type(DATA_X) = {type(DATA_X)}")
+            print(f"type(DATA_Y) = {type(DATA_Y)}")
+            print("エラー：：Numpy型である必要があります。")
+            raise
+
+        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
+            print(f"DATA_X.ndim = {DATA_X.ndim}")
+            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
+            raise ValueError("エラー：：次元数が一致しません。")
+        
+        # 対称行列であるか判定
+        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
+            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
+            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
+            raise ValueError("エラー：：対称行列ではありません。")
+
+        if type(DATA_Y) == type(None):
+            self.cache = DATA_X @ DATA_X.T
+        else:
+            self.cache = DATA_X @ DATA_Y.T
+        
+        return (self.alpha * self.cache)
+    
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache
+        return (diff_alpha,)
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+        else:
+            Δalpha = self.alpha + eta * Δtheta[0]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
+        
+        self.alpha = Δalpha
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha,)
+    
+    def __add__(self, other):
+        if not isinstance(other, Kernel):
+            other = ConstantKernel(other)
+        return SumKernel(self, other)
+
+class ExponentialKernel(Kernel):
+    def __init__(self, alpha:float, beta:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
+        super().__init__()
+        self.alpha     = alpha
+        self.beta      = beta
+        self.isL1Reg   = isL1Reg
+        self.isL2Reg   = isL2Reg
+        self.isNonNeg  = isNonNeg
+        self.cache_mol = np.zeros([1, 1])
+        self.cache_cor = np.zeros([1, 1])
+        return None
+
+    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
+        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
+            print(f"type(DATA_X) = {type(DATA_X)}")
+            print(f"type(DATA_Y) = {type(DATA_Y)}")
+            print("エラー：：Numpy型である必要があります。")
+            raise
+
+        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
+            print(f"DATA_X.ndim = {DATA_X.ndim}")
+            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
+            raise ValueError("エラー：：次元数が一致しません。")
+        
+        # 対称行列であるか判定
+        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
+            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
+            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
+            raise ValueError("エラー：：対称行列ではありません。")
+
+        if type(DATA_Y) == type(None):
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock")) / self.beta
+            self.cache_cor = np.exp(-self.cache_mol)
+        else:
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock") / self.beta
+            self.cache_cor = np.exp(-self.cache_mol)
+        
+        return (self.alpha * self.cache_cor)
+    
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache_cor
+        diff_beta  = self.alpha * self.cache_cor * self.cache_mol / self.beta
+        return (diff_alpha, diff_beta)
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
+        else:
+            Δalpha = self.alpha + eta * Δtheta[0]
+            Δbeta  = self.beta  + eta * Δtheta[1]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
+            Δbeta  = np.maximum(Δbeta,  0)
+        
+        self.alpha = Δalpha
+        self.beta  = Δbeta
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha, self.beta)
+    
+    def __add__(self, other):
+        if not isinstance(other, Kernel):
+            other = ConstantKernel(other)
+        return SumKernel(self, other)
+
+class PeriodicKernel(Kernel):
+    def __init__(self, alpha:float, beta:float, gamma:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
+        super().__init__()
+        self.alpha     = alpha
+        self.beta      = beta
+        self.gamma     = gamma
+        self.isL1Reg   = isL1Reg
+        self.isL2Reg   = isL2Reg
+        self.isNonNeg  = isNonNeg
+        self.cache_mol = np.zeros([1, 1])
+        self.cache_cor = np.zeros([1, 1])
+        return None
+
+    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
+        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
+            print(f"type(DATA_X) = {type(DATA_X)}")
+            print(f"type(DATA_Y) = {type(DATA_Y)}")
+            print("エラー：：Numpy型である必要があります。")
+            raise
+
+        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
+            print(f"DATA_X.ndim = {DATA_X.ndim}")
+            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
+            raise ValueError("エラー：：次元数が一致しません。")
+        
+        # 対称行列であるか判定
+        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
+            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
+            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
+            raise ValueError("エラー：：対称行列ではありません。")
+
+        if type(DATA_Y) == type(None):
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock")) / self.gamma
+            self.cache_cor = np.exp(self.beta * np.cos(self.cache_mol))
+        else:
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock") / self.gamma
+            self.cache_cor = np.exp(self.beta * np.cos(self.cache_mol))
+        
+        return (self.alpha * self.cache_cor)
+    
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache_cor
+        diff_beta  = self.alpha * self.cache_cor * np.cos(self.cache_mol)
+        diff_gamma = self.alpha * self.cache_cor * self.beta * np.sin(self.cache_mol) * self.cache_mol / self.gamma
+        return (diff_alpha, diff_beta, diff_gamma)
+    
+    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
+            Δgamma = soft_threshold(self.gamma + eta * Δtheta[2], eta * l1_norm)
+        else:
+            Δalpha = self.alpha + eta * Δtheta[0]
+            Δbeta  = self.beta  + eta * Δtheta[1]
+            Δgamma = self.gamma + eta * Δtheta[2]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta * l2_norm)
+            Δgamma = Δgamma / (1 + eta * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
+            Δbeta  = np.maximum(Δbeta,  0)
+            Δgamma = np.maximum(Δgamma, 0)
+        
+        self.alpha = Δalpha
+        self.beta  = Δbeta
+        self.gamma = Δgamma
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha, self.beta, self.gamma)
     
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -313,13 +562,13 @@ class GaussKernel(Kernel):
 
 class Gaussian_Process_Regression:
     def __init__(self,
-                 vec_data_y:np.ndarray,              # 学習対象出力データY
                  mat_data_x:np.ndarray,              # 学習対象入力データX
+                 vec_data_y:np.ndarray,              # 学習対象出力データY
                  kernel:Kernel,                      # 相関カーネル
                  norm_α:float=1.0,                   # L1・L2正則化パラメータの強さ
                  l1_ratio:float=0.1,                 # L1・L2正則化の強さ配分・比率
-                 tol:float=1e-6,                     # 許容誤差
-                 isStandardization:bool=True,        # 標準化処理の適用有無
+                 eta:float=1e-5,                     # 学習率η
+                 tol:float=1e-8,                     # 許容誤差
                  max_iterate:int=300000,             # 最大ループ回数
                  random_state=None) -> None:         # 乱数のシード値
         if (type(vec_data_y) is not np.ndarray) or (type(mat_data_x) is not np.ndarray):
@@ -336,13 +585,13 @@ class Gaussian_Process_Regression:
             print("エラー：：次元数が一致しません。")
             raise
 
-        self.vec_data_y        = np.copy(vec_data_y)
         self.mat_data_x        = np.copy(mat_data_x)
+        self.vec_data_y        = np.copy(vec_data_y)
         self.kernel            = kernel
-        self.tol               = tol
         self.norm_α            = np.abs(norm_α)
         self.l1_ratio          = np.where(l1_ratio < 0, 0, np.where(l1_ratio > 1, 1, l1_ratio))
-        self.isStandardization = isStandardization
+        self.eta               = eta
+        self.tol               = tol
         self.max_iterate       = round(max_iterate)
 
         self.random_state = random_state
@@ -368,24 +617,17 @@ class Gaussian_Process_Regression:
         data_num, expvars = x_data.shape
         _,        objvars = y_data.shape
         
-        # 標準化指定の有無
-        if self.isStandardization:
-            # x軸の標準化
-            self.x_mean    = np.mean(x_data, axis=0)
-            self.x_std_dev = np.std( x_data, axis=0)
-            self.x_std_dev[self.x_std_dev < 1e-32] = 1
-            x_data = (x_data - self.x_mean) / self.x_std_dev
-            
-            # y軸の標準化
-            self.y_mean    = np.mean(y_data, axis=0)
-            self.y_std_dev = np.std( y_data, axis=0)
-            self.y_std_dev[self.y_std_dev < 1e-32] = 1
-            y_data = (y_data - self.y_mean) / self.y_std_dev
-        else:
-            self.x_mean    = np.zeros(expvars)
-            self.x_std_dev = np.ones( expvars)
-            self.y_mean    = np.zeros(objvars)
-            self.y_std_dev = np.ones( objvars)
+        # x軸の標準化
+        self.x_mean    = np.mean(x_data, axis=0)
+        self.x_std_dev = np.std( x_data, axis=0)
+        self.x_std_dev[self.x_std_dev < 1e-32] = 1
+        x_data = (x_data - self.x_mean) / self.x_std_dev
+        
+        # y軸の標準化
+        self.y_mean    = np.mean(y_data, axis=0)
+        self.y_std_dev = np.std( y_data, axis=0)
+        self.y_std_dev[self.y_std_dev < 1e-32] = 1
+        y_data = (y_data - self.y_mean) / self.y_std_dev
             
         
         # 本ライブラリで実装されているアルゴリズムは以下の4点となる
@@ -399,27 +641,25 @@ class Gaussian_Process_Regression:
         # 特にISTAは勾配降下法と同等の性質を有しているため、異なる近似解が得られる
         # すなわち実行のたびに異なる解が導かれるかつ極所最適解に落ち着くことがある
         # また、外部ライブラリとしてsklearn.gaussian_process.GaussianProcessRegressorを利用することもできる
-        # この外部ライブラリは内部で座標降下法で探索を行っている点で本ライブラリと同等である
-        # 一方で、この外部ライブラリはC言語(Cython)を利用してチューニングが行われている
+        # この外部ライブラリは内部でコレスキー分解による連立方程式という形で解を求めている点で本ライブラリと同等である
+        # 一方で、この外部ライブラリはC言語(lapack)を利用してチューニングが行われている
         # また広く公開され、多くの人に利用されているライブラリでもあるため速度・品質ともにレベルが高い
         # 探索解の品質を保証したいのであれば、外部ライブラリの利用を強く推奨する
-        # 一方で、外部ライブラリはデータの標準化処理に対応していない点に注意する必要がある
-        # データの標準化処理を行う場合にはL1・L2正則化項の調整を行う必要があるが、外部ライブラリでは行うことができないためである
+        # 一方で、外部ライブラリはL1・L2正則化及び非負制約について付加することができない点に注意が必要である
         # 最後に広く認められているわけではないため使用の際には注意が必要であるが、本ライブラリにて実装済みの
         # これら3種類のアルゴリズムが想定する目的関数は以下のとおり
-        # A = 説明変数x + 切片b の行列(データ数n ✖️ (説明変数数s + 1))
-        # B = 目的変数y の行列(データ数n ✖️ 目的変数数m)
-        # X = 説明変数xの係数 + 切片bの係数 の行列((説明変数数s + 1) ✖️ 目的変数数m)
         # λ_1 = 正則化の強度 * l1_ratio
         # λ_2 = 正則化の強度 * (1 - l1_ratio)
+        # μ = 目的変数y の平均値
+        # Σ = カーネルK(x,x')による分散共分散行列
         # math: \begin{equation}
         # math: \begin{split}
-        # math: Objective &= \frac{1}{n} \| B - AX \|_2^2 + \frac{λ_2}{2} \| X \|_2^2 + λ_1 \|X\|_1 \\
-        # math: &= tr [ \left( B - AX \right) ^T \left( B - AX \right) ] + \frac{λ_2 n}{2} tr [ X^T X ] + λ_1 n \sum_{i=1} |x_i |
+        # math: Objective &= Normal(μ_2 + Σ_21 Σ_11^-1 (x_1 - μ_1), Σ_22 - Σ_11^-1 Σ_12)
+        # math: &= Normal(Σ_21 Σ_11^-1 x_1, Σ_22 - Σ_11^-1 Σ_12)
         # math: \end{split}
         # math: \end{equation}
         # 参考までに各オプションごとの実行速度は以下の通り
-        # external library  >>  FISTA  >>  ISTA  >>  coordinate descent
+        # external library  >>  FISTA  >>  ISTA
         
         if   solver == "external library":
             # GaussianProcessRegressorの外部ライブラリである
@@ -433,82 +673,81 @@ class Gaussian_Process_Regression:
                                         + kernels.ConstantKernel() * kernels.ExpSineSquared()
                                         + kernels.ConstantKernel() * kernels.RBF()
                                         + kernels.ConstantKernel() * kernels.WhiteKernel()), 
-                                alpha=0, random_state=0)
-            self.model.fit(x_data, y_data)
-            self.alpha = self.model.alpha_
-            
-        elif solver == "coordinate descent":
-            # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)を行なっている
-            # 注意点として、切片に対してはラッソ最適化を行わないことが挙げられる
-            # リッジ最適化は一般に係数を0にするためではなく、最適化対象のパラメータ全体を小さく保つために利用される
-            # 一方で、ラッソ最適化は係数を0にするために利用される手法である
-            # そのため、一般にはラッソ最適化を切片に対しては適用しない習慣がある
-            # このライブラリもこの習慣に従うことにする
-            # リッジ最適化についても切片に対しては適用しないことにした
-            # これは標準化を行う前と後で、正則化の効果が変動してしまうことを防ぐためである
-            # 実装アルゴリズムは座標降下法である
-            # できる限り高速に処理を行いたかったので、このような実装になった
-            # このアルゴリズムの計算量は、O(ループ回数 × 説明変数の数 × O(行列積))である
-            # 1×M, M×Lの大きさを持つ行列A, Bを想定すると、行列積の計算量はO(ML)となる
-            # このSVARライブラリではそれぞれ、M=(説明変数の数 + 1) L=目的変数の数に対応している
-            # 計算量オーダーを書き直すと O(ループ回数 × 説明変数の数 × ML)となる
-            # このアルゴリズムを利用するにあたって、学習対象データの標準化などの条件は特にない
-            # しかし多くの場合において、標準化処理を施してある学習データに対する学習速度は早い
-            # その意味で標準化処理を推奨する
-            l1_norm = self.norm_α * self.l1_ratio       * data_num
-            l2_norm = self.norm_α * (1 - self.l1_ratio) * data_num
-            K    = self.kernel.correlation(x_data)
-            L, d = modified_cholesky(K)
-            
-            # L2NORM = l2_norm * np.identity(expvars + 1)
-            # L2NORM[0:expvars, 0:expvars] = L2NORM[0:expvars, 0:expvars] / np.square(self.x_std_dev.reshape([1, expvars]))
-            # L2NORM[expvars,   expvars]   = 0
-            # L = np.dot(A.T, A) + L2NORM
-            # R = np.dot(A.T, b)
-            # D = np.diag(np.diag(L))
-            # G = np.diag(L)
-            # C = L - D
-            z = solve_triangular(L,       y_data, lower=True)
-            x = solve_triangular(d @ L.T, z,      lower=False)
-            self.trian = L
-            self.diag  = d
-            self.alpha = x
+                                alpha=1e-8, random_state=0)
+            self.model.fit(self.mat_data_x, self.vec_data_y)
+            self.solver = "external library"
+
             
         elif solver == "ISTA":
-            # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)を行なっている
-            # 注意点として、切片に対してはラッソ最適化を行わないことが挙げられる
-            # リッジ最適化は一般に係数を0にするためではなく、最適化対象のパラメータ全体を小さく保つために利用される
-            # 一方で、ラッソ最適化は係数を0にするために利用される手法である
-            # そのため、一般にはラッソ最適化を切片に対しては適用しない習慣がある
-            # このライブラリもこの習慣に従うことにする
-            # リッジ最適化についても切片に対しては適用しないことにした
-            # これは標準化を行う前と後で、正則化の効果が変動してしまうことを防ぐためである
+            # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)及び非負制約を行なっている
+            # 注意点として、各種正則化・制約の適用有無はカーネル単位で決定されている
+            # それはカーネル毎にその性質が全く異なり、一律に適用することができないためである
+            # この処理部では、あくまで各種正則化・制約を適用する場合の強度λを決定するのみである
             # 実装アルゴリズムは一般的なメジャライザー最適化(ISTA: Iterative Shrinkage soft-Thresholding Algorithm)である
             # このアルゴリズムのメジャライザー部分は勾配降下法の更新式に等しい
             # このアルゴリズムを利用する際の注意点として、以下の２つが挙げられる
             # ・教師データ(X, Y)がそれぞれ標準化されている必要があること
             # ・設定イレーション回数が十分でない場合に、大域的最適解への収束が保証できないこと
-            # 標準化されていない場合にはうまく収束しないくなる等、アルゴリズムが機能しなくなる可能性がある
-            # isStandardization=True に設定しておけば、問題ない
-            pass     
+            # 無条件に教師データに正規化処理を施すことにしたため、概ねの場合に問題ない
+            l1_norm = self.norm_α * self.l1_ratio
+            l2_norm = self.norm_α * (1 - self.l1_ratio)
+            for idx in range(0, self.max_iterate):
+                K     = self.kernel.correlation(x_data)
+                dK    = self.kernel.diff_theta()
+                ΔDiff = diff_log_likelihood(K, y_data, dK)
+                self.kernel.update_theta(ΔDiff, self.eta, l1_norm, l2_norm)
+                
+                mse = np.sum(elem ** 2 for elem in ΔDiff)
+                if idx % 1000 == 0:
+                    print(f"ite:{idx+1}  mse:{mse}  x_new:{self.kernel.get_theta()}")
+                
+                if np.sqrt(mse) <= self.tol:
+                    break
+
+            self.solver = "ISTA"
         
         elif solver == "FISTA":
-            # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)を行なっている
-            # 注意点として、切片に対してはラッソ最適化を行わないことが挙げられる
-            # リッジ最適化は一般に係数を0にするためではなく、最適化対象のパラメータ全体を小さく保つために利用される
-            # 一方で、ラッソ最適化は係数を0にするために利用される手法である
-            # そのため、一般にはラッソ最適化を切片に対しては適用しない習慣がある
-            # このライブラリもこの習慣に従うことにする
-            # リッジ最適化についても切片に対しては適用しないことにした
-            # これは標準化を行う前と後で、正則化の効果が変動してしまうことを防ぐためである
+            # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)及び非負制約を行なっている
+            # 注意点として、各種正則化・制約の適用有無はカーネル単位で決定されている
+            # それはカーネル毎にその性質が全く異なり、一律に適用することができないためである
+            # この処理部では、あくまで各種正則化・制約を適用する場合の強度λを決定するのみである
             # 実装アルゴリズムは一般的なメジャライザー最適化(FISTA: Fast Iterative Shrinkage soft-Thresholding Algorithm)である
             # このアルゴリズムのメジャライザー部分は勾配降下法の更新式に等しい
             # このアルゴリズムを利用する際の注意点として、以下の２つが挙げられる
             # ・教師データ(X, Y)がそれぞれ標準化されている必要があること
             # ・設定イレーション回数が十分でない場合に、大域的最適解への収束が保証できないこと
-            # 標準化されていない場合にはうまく収束しないくなる等、アルゴリズムが機能しなくなる可能性がある
-            # isStandardization=True に設定しておけば、問題ない
-            pass
+            # 無条件に教師データに正規化処理を施すことにしたため、概ねの場合に問題ない
+            l1_norm = self.norm_α * self.l1_ratio
+            l2_norm = self.norm_α * (1 - self.l1_ratio)
+            x_k_m_1      = self.kernel.get_theta()
+            time_k       = 0
+            Base_Loss    = 0
+            for idx in range(0, self.max_iterate):
+                K     = self.kernel.correlation(x_data)
+                dK    = self.kernel.diff_theta()
+                ΔDiff = diff_log_likelihood(K, y_data, dK)
+                
+                time_k_a_1 = (1 + np.sqrt(1 + 4 * (time_k ** 2))) / 2
+                ΔDiff_new  = tuple(diff + (time_k - 1) / (time_k_a_1) * (diff - diff_m_1) if idx != 0 else diff for diff, diff_m_1 in zip(ΔDiff, x_k_m_1))
+
+                self.kernel.update_theta(ΔDiff_new, self.eta, l1_norm, l2_norm)
+                
+                time_k  = time_k_a_1
+                x_k_m_1 = ΔDiff
+                
+                mse = np.sum(elem ** 2 for elem in ΔDiff)
+                if idx % 1000 == 0:
+                    print(f"ite:{idx+1}  Abs Err:{np.abs(Base_Loss - mse)}  x_new:{self.kernel.get_theta()}")
+                
+                if (idx != 1) and (np.abs(Base_Loss - mse) <= self.tol):
+                    break
+                else:
+                    Base_Loss = mse
+                
+                if np.sqrt(mse) <= self.tol:
+                    break
+
+            self.solver = "FISTA"
             
         else:
             raise
@@ -516,28 +755,36 @@ class Gaussian_Process_Regression:
         self.learn_flg = True
         return self.learn_flg
     
-    def predict(self, test_X:np.ndarray, return_std:bool=False, return_cov:bool=False) -> np.ndarray:
+    def predict(self, test_X:np.ndarray, return_std:bool=False, return_cov:bool=False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        if return_std and return_cov:
+            raise RuntimeError("At most one of return_std or return_cov can be requested.")
+
+        if self.solver == "external library":
+            res = self.model.predict(test_X, return_std=return_std, return_cov=return_cov)
+            return res
+
         x_data = self.mat_data_x
+        y_data = self.vec_data_y
         x_test = test_X
-        if self.isStandardization:
-            # x軸の標準化
-            self.x_mean    = np.mean(x_data, axis=0)
-            self.x_std_dev = np.std( x_data, axis=0)
-            self.x_std_dev[self.x_std_dev < 1e-32] = 1
-            x_data = (x_data - self.x_mean) / self.x_std_dev
-            x_test = (x_test - self.x_mean) / self.x_std_dev
+
+        # x軸の標準化
+        x_data = (x_data - self.x_mean) / self.x_std_dev
+        x_test = (x_test - self.x_mean) / self.x_std_dev
+        # y軸の標準化
+        y_data = (y_data - self.y_mean) / self.y_std_dev
+        
 
         # 予測平均・予測分散の算出
+        K      = self.kernel.correlation(x_data)
         K_     = self.kernel.correlation(x_data, x_test)
         K__    = self.kernel.correlation(x_test)
-        V      = self.trian.T @ K_
-        y_pred = K_.T @ self.alpha
-        y_var  = K__ - V.T @ self.diag @ V
+        y_pred = K_.T @ modcho_solve(K, y_data)
+        y_var  = K__ - K_.T @ modcho_solve(K, K_)
 
-        if self.isStandardization:
-            # y軸の標準化をもとに戻す
-            y_pred = self.y_std_dev * y_pred + self.y_mean
-            y_var  = y_var * self.y_std_dev**2
+
+        # y軸の標準化をもとに戻す
+        y_pred = self.y_std_dev * y_pred + self.y_mean
+        y_var  = y_var * self.y_std_dev**2
 
         if return_cov:
             return y_pred, y_var
