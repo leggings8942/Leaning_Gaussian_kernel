@@ -61,6 +61,115 @@ def diff_log_likelihood(K:np.ndarray, y:np.ndarray, dKθ:Tuple[np.ndarray]) -> n
     ΔDiff  = tuple(diff_θ.item() for diff_θ in ΔDiff)
     return ΔDiff
 
+
+class Update_RAdam:
+    def __init__(self, alpha=0.0001, beta1=0.999, beta2=0.9999):
+        self.alpha   = alpha
+        self.beta1   = beta1
+        self.beta2   = beta2
+        self.time    = 0
+        self.beta1_t = 1
+        self.beta2_t = 1
+        self.m       = 0.0
+        self.v       = 0.0
+        self.ρ_inf   = 0
+
+    def update(self, grads):
+        if self.time == 0:
+            self.m      = 0.0
+            self.v      = 0.0
+            self.ρ_inf  = 2 / (1 - self.beta2) - 1
+        
+        ε = 1e-32
+        self.time    += 1
+        self.beta1_t *= self.beta1
+        self.beta2_t *= self.beta2
+
+        self.m = self.beta1 * self.m + (1 - self.beta1) * grads
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (grads ** 2)
+        m_hat = self.m / (1 - self.beta1_t)
+        ρ_t   = self.ρ_inf - 2 * self.time * self.beta2_t / (1 - self.beta2_t)
+
+        if self.time > 4:
+            l_t = np.sqrt((1 - self.beta2_t) / self.v)
+            r_t = np.sqrt((ρ_t - 4) * (ρ_t - 2) * self.ρ_inf) / np.sqrt((self.ρ_inf - 4) * (self.ρ_inf - 2) * ρ_t)
+            tmp_alpha = self.alpha * r_t * l_t
+        
+        else:
+            tmp_alpha = self.alpha
+
+        return tmp_alpha, m_hat
+
+
+def soft_maximum(x, α):
+    if x >= 0:
+        return  np.abs(x) + α
+    else:
+        return -np.abs(x) + α
+
+class Update_Rafael:
+    def __init__(self, alpha=0.0001, beta=0.999, isSHC=False):
+        self.alpha  = alpha
+        self.beta   = beta
+        self.time   = 0
+        self.beta_t = 1
+        self.m      = 0.0
+        self.v      = 0.0
+        self.w      = 0.0
+        self.σ_coef = 0
+        self.isSHC = isSHC
+
+    def update(self, grads):
+        if self.time == 0:
+            self.m      = 0.0
+            self.v      = 0.0
+            self.w      = 0.0
+            self.σ_coef = (1 + self.beta) / 2
+        
+        ε = 1e-32
+        self.time   += 1
+        self.beta_t *= self.beta
+
+        self.m = self.beta * self.m + (1 - self.beta) * grads
+        m_hat = self.m / (1 - self.beta_t)
+
+        self.v = self.beta * self.v + (1 - self.beta) * (grads ** 2)
+        self.w = self.beta * self.w + (1 - self.beta) * ((grads / soft_maximum(m_hat, ε) - 1) ** 2)
+        
+        if self.beta - self.beta_t > 0.1:
+            v_hat  = self.v * self.σ_coef / (self.beta - self.beta_t)
+            w_hat  = self.w * self.σ_coef / (self.beta - self.beta_t)
+            σ_com  = np.sqrt((v_hat + w_hat + ε) / 2)
+            # σ_hes  = np.sqrt(w_hat + ε)
+            
+            # self-healing canonicalization
+            R = 0
+            if self.isSHC:
+                def chebyshev(r):
+                    tmp1 = σ_com + r
+                    tmp2 = np.square(m_hat / tmp1)
+                    f    =     np.sum(tmp2,                   axis=0) - r
+                    df   = 2 * np.sum(tmp2 / tmp1,            axis=0) + 1
+                    ddf  = 6 * np.sum(tmp2 / np.square(tmp1), axis=0)
+                    newt = f / df
+                    return r + newt + ddf / (2 * df) * np.square(newt)
+                
+                r_min = np.sum(np.square(m_hat / σ_com), axis=0)
+                r_max = np.cbrt(np.sum(np.square(m_hat), axis=0))
+                R = np.maximum(np.minimum(r_max, r_min), 1)
+                R = chebyshev(R)
+                # R = chebyshev(R)     # option: 精度を求めるならチェビシェフ法を2回適用する
+                R = np.maximum(R, 1) # option: 収束速度は遅くなるが、安定性が向上する
+            
+            tmp_alpha = self.alpha / (σ_com + R)
+            output    = m_hat
+        else:
+            tmp_alpha = self.alpha
+            output    = np.sign(grads)
+        
+        return tmp_alpha, output
+
+
 # 相関係数カーネルのインターフェース
 class Kernel(metaclass=ABCMeta):
     @abstractmethod
@@ -85,11 +194,12 @@ class Kernel(metaclass=ABCMeta):
 
 # 定数カーネル
 class ConstantKernel(Kernel):
-    def __init__(self, alpha:float, isL1Reg:bool=True, isL2Reg:bool=True):
+    def __init__(self, alpha:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
         super().__init__()
         self.alpha    = alpha
         self.isL1Reg  = isL1Reg
         self.isL2Reg  = isL2Reg
+        self.isNonNeg = isNonNeg
         self.cache    = np.zeros([1, 1])
         return None
 
@@ -122,16 +232,20 @@ class ConstantKernel(Kernel):
         diff_alpha = self.cache
         return (diff_alpha,)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # L1正則化が有効か
         if self.isL1Reg:
-            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
         else:
-            Δalpha = self.alpha + eta * Δtheta[0]
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
         
         # L2正則化が有効か
         if self.isL2Reg:
-            Δalpha = Δalpha / (1 + eta * l2_norm)
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
         
         self.alpha = Δalpha
         return True
@@ -178,13 +292,13 @@ class SumKernel(Kernel):
         diff_tuple = reduce(lambda x, y: x + y, [elem.diff_theta() for elem in self.kernels])
         return diff_tuple
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # それぞれの枝における葉ノードのハイパーパラメータの数が不明であるため
         # これの探索を行う
         tmp_tuple = Δtheta
         for elem in self.kernels:
             theta_num = len(elem.get_theta())
-            elem.update_theta(tmp_tuple[0:theta_num], eta=eta, l1_norm=l1_norm, l2_norm=l2_norm)
+            elem.update_theta(tmp_tuple[0:theta_num], eta=eta[0:theta_num], l1_norm=l1_norm, l2_norm=l2_norm)
             tmp_tuple = tmp_tuple[theta_num:]
         return True
     
@@ -242,8 +356,8 @@ class WhiteNoiseKernel(Kernel):
         diff_alpha = self.cache * self.alpha
         return (diff_alpha,)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:        
-        self.alpha = self.alpha + eta * Δtheta[0]
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:        
+        self.alpha = self.alpha + eta[0] * Δtheta[0]
         return True
     
     def get_theta(self) -> Tuple:
@@ -292,32 +406,32 @@ class GaussKernel(Kernel):
             raise ValueError("エラー：：対称行列ではありません。")
 
         if type(DATA_Y) == type(None):
-            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="sqeuclidean")) / self.beta
-            self.cache_cor = np.exp(-self.cache_mol)
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="sqeuclidean"))
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
         else:
-            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="sqeuclidean") / self.beta
-            self.cache_cor = np.exp(-self.cache_mol)
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="sqeuclidean")
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
         
         return (self.alpha * self.cache_cor)
     
     def diff_theta(self) -> Tuple:
         diff_alpha = self.cache_cor
-        diff_beta  = self.alpha * self.cache_cor * self.cache_mol / self.beta
+        diff_beta  = self.alpha * self.cache_cor * (-self.cache_mol)
         return (diff_alpha, diff_beta)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # L1正則化が有効か
         if self.isL1Reg:
-            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
-            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta[1] * Δtheta[1], eta[1] * l1_norm)
         else:
-            Δalpha = self.alpha + eta * Δtheta[0]
-            Δbeta  = self.beta  + eta * Δtheta[1]
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
+            Δbeta  = self.beta  + eta[1] * Δtheta[1]
         
         # L2正則化が有効か
         if self.isL2Reg:
-            Δalpha = Δalpha / (1 + eta * l2_norm)
-            Δbeta  = Δbeta  / (1 + eta * l2_norm)
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta[1] * l2_norm)
         
         # 非負制約が有効か
         if self.isNonNeg:
@@ -375,16 +489,16 @@ class LinearKernel(Kernel):
         diff_alpha = self.cache
         return (diff_alpha,)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # L1正則化が有効か
         if self.isL1Reg:
-            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
         else:
-            Δalpha = self.alpha + eta * Δtheta[0]
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
         
         # L2正則化が有効か
         if self.isL2Reg:
-            Δalpha = Δalpha / (1 + eta * l2_norm)
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
         
         # 非負制約が有効か
         if self.isNonNeg:
@@ -432,32 +546,32 @@ class ExponentialKernel(Kernel):
             raise ValueError("エラー：：対称行列ではありません。")
 
         if type(DATA_Y) == type(None):
-            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock")) / self.beta
-            self.cache_cor = np.exp(-self.cache_mol)
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock"))
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
         else:
-            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock") / self.beta
-            self.cache_cor = np.exp(-self.cache_mol)
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock")
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
         
         return (self.alpha * self.cache_cor)
     
     def diff_theta(self) -> Tuple:
         diff_alpha = self.cache_cor
-        diff_beta  = self.alpha * self.cache_cor * self.cache_mol / self.beta
+        diff_beta  = self.alpha * self.cache_cor * (-self.cache_mol)
         return (diff_alpha, diff_beta)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # L1正則化が有効か
         if self.isL1Reg:
-            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
-            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta[1] * Δtheta[1], eta[1] * l1_norm)
         else:
-            Δalpha = self.alpha + eta * Δtheta[0]
-            Δbeta  = self.beta  + eta * Δtheta[1]
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
+            Δbeta  = self.beta  + eta[1] * Δtheta[1]
         
         # L2正則化が有効か
         if self.isL2Reg:
-            Δalpha = Δalpha / (1 + eta * l2_norm)
-            Δbeta  = Δbeta  / (1 + eta * l2_norm)
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta[1] * l2_norm)
         
         # 非負制約が有効か
         if self.isNonNeg:
@@ -508,36 +622,36 @@ class PeriodicKernel(Kernel):
             raise ValueError("エラー：：対称行列ではありません。")
 
         if type(DATA_Y) == type(None):
-            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock")) / self.gamma
-            self.cache_cor = np.exp(self.beta * np.cos(self.cache_mol))
+            self.cache_mol = spd.squareform(spd.pdist(DATA_X, metric="cityblock"))
+            self.cache_cor = np.exp(self.beta * np.cos(self.gamma * self.cache_mol))
         else:
-            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock") / self.gamma
-            self.cache_cor = np.exp(self.beta * np.cos(self.cache_mol))
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="cityblock")
+            self.cache_cor = np.exp(self.beta * np.cos(self.gamma * self.cache_mol))
         
         return (self.alpha * self.cache_cor)
     
     def diff_theta(self) -> Tuple:
         diff_alpha = self.cache_cor
         diff_beta  = self.alpha * self.cache_cor * np.cos(self.cache_mol)
-        diff_gamma = self.alpha * self.cache_cor * self.beta * np.sin(self.cache_mol) * self.cache_mol / self.gamma
+        diff_gamma = self.alpha * self.cache_cor * self.beta * (-np.sin(self.cache_mol)) * self.cache_mol
         return (diff_alpha, diff_beta, diff_gamma)
     
-    def update_theta(self, Δtheta:Tuple, eta:float=1e-6, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
         # L1正則化が有効か
         if self.isL1Reg:
-            Δalpha = soft_threshold(self.alpha + eta * Δtheta[0], eta * l1_norm)
-            Δbeta  = soft_threshold(self.beta  + eta * Δtheta[1], eta * l1_norm)
-            Δgamma = soft_threshold(self.gamma + eta * Δtheta[2], eta * l1_norm)
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta[1] * Δtheta[1], eta[1] * l1_norm)
+            Δgamma = soft_threshold(self.gamma + eta[2] * Δtheta[2], eta[2] * l1_norm)
         else:
-            Δalpha = self.alpha + eta * Δtheta[0]
-            Δbeta  = self.beta  + eta * Δtheta[1]
-            Δgamma = self.gamma + eta * Δtheta[2]
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
+            Δbeta  = self.beta  + eta[1] * Δtheta[1]
+            Δgamma = self.gamma + eta[2] * Δtheta[2]
         
         # L2正則化が有効か
         if self.isL2Reg:
-            Δalpha = Δalpha / (1 + eta * l2_norm)
-            Δbeta  = Δbeta  / (1 + eta * l2_norm)
-            Δgamma = Δgamma / (1 + eta * l2_norm)
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta[1] * l2_norm)
+            Δgamma = Δgamma / (1 + eta[2] * l2_norm)
         
         # 非負制約が有効か
         if self.isNonNeg:
@@ -602,7 +716,7 @@ class Gaussian_Process_Regression:
             self.random = np.random
 
 
-    def fit(self, solver:str='external library', visible_flg:bool=False) -> bool:
+    def fit(self, solver:str='external library', visible_flg:bool=False, useRAdam:bool=False) -> bool:
         # 本ライブラリにおいてエラーの出力を行わないのは、近似的にでも処理結果が欲しいためである
         # また、solverとしてISTA・FISTAを使用する際にも注意が必要である
         # ISTA・FISTAは勾配降下法に似た特徴を有しており、対象の最適化パラメータのスケールに弱い
@@ -695,7 +809,8 @@ class Gaussian_Process_Regression:
                 K     = self.kernel.correlation(x_data)
                 dK    = self.kernel.diff_theta()
                 ΔDiff = diff_log_likelihood(K, y_data, dK)
-                self.kernel.update_theta(ΔDiff, self.eta, l1_norm, l2_norm)
+                ETA   = tuple(self.eta for _ in self.kernel.get_theta())
+                self.kernel.update_theta(ΔDiff, ETA, l1_norm, l2_norm)
                 
                 mse = np.sum(elem ** 2 for elem in ΔDiff)
                 if idx % 1000 == 0:
@@ -706,43 +821,44 @@ class Gaussian_Process_Regression:
 
             self.solver = "ISTA"
         
-        elif solver == "FISTA":
+        elif solver == "OPTIMIZER":
             # ラッソ最適化(L1正則化)とリッジ最適化(L2正則化)及び非負制約を行なっている
             # 注意点として、各種正則化・制約の適用有無はカーネル単位で決定されている
             # それはカーネル毎にその性質が全く異なり、一律に適用することができないためである
             # この処理部では、あくまで各種正則化・制約を適用する場合の強度λを決定するのみである
-            # 実装アルゴリズムは一般的なメジャライザー最適化(FISTA: Fast Iterative Shrinkage soft-Thresholding Algorithm)である
+            # 実装アルゴリズムはメジャライザー最適化(ISTA: Fast Iterative Shrinkage soft-Thresholding Algorithm)の亜種である
+            # 近接勾配法にオプティマイザとしてRafaelを適用した
+            # 収束速度の向上と解の安定性の両面でプレーンなISTAよりも向上している
+            # ただし、Rafaelというオプティマイザはアドインテ社員による自作アルゴリズムである
+            # そのため、絶対的な信頼性に乏しい
+            # 信頼性を重視する場合にはRAdamというオプティマイザを使用するようにしてほしい
             # このアルゴリズムのメジャライザー部分は勾配降下法の更新式に等しい
             # このアルゴリズムを利用する際の注意点として、以下の２つが挙げられる
             # ・教師データ(X, Y)がそれぞれ標準化されている必要があること
             # ・設定イレーション回数が十分でない場合に、大域的最適解への収束が保証できないこと
             # 無条件に教師データに正規化処理を施すことにしたため、概ねの場合に問題ない
+            if useRAdam:
+                optims = tuple(Update_RAdam(self.eta)  for _ in self.kernel.get_theta())
+            else:
+                optims = tuple(Update_Rafael(self.eta) for _ in self.kernel.get_theta())
             l1_norm = self.norm_α * self.l1_ratio
             l2_norm = self.norm_α * (1 - self.l1_ratio)
-            x_k_m_1      = self.kernel.get_theta()
-            time_k       = 0
-            Base_Loss    = 0
             for idx in range(0, self.max_iterate):
-                K     = self.kernel.correlation(x_data)
-                dK    = self.kernel.diff_theta()
-                ΔDiff = diff_log_likelihood(K, y_data, dK)
-                
-                time_k_a_1 = (1 + np.sqrt(1 + 4 * (time_k ** 2))) / 2
-                ΔDiff_new  = tuple(diff + (time_k - 1) / (time_k_a_1) * (diff - diff_m_1) if idx != 0 else diff for diff, diff_m_1 in zip(ΔDiff, x_k_m_1))
-
-                self.kernel.update_theta(ΔDiff_new, self.eta, l1_norm, l2_norm)
-                
-                time_k  = time_k_a_1
-                x_k_m_1 = ΔDiff
+                K         = self.kernel.correlation(x_data)
+                dK        = self.kernel.diff_theta()
+                ΔDiff     = diff_log_likelihood(K, y_data, dK)
+                ΔDiff_opt = tuple(optim.update(diff) for optim, diff in zip(optims, ΔDiff))
+                ΔDiff_upd = tuple(update for _, update in ΔDiff_opt)
+                ΔDiff_alp = tuple(alpha  for alpha, _  in ΔDiff_opt)
+                self.kernel.update_theta(ΔDiff_upd, ΔDiff_alp, l1_norm, l2_norm)
                 
                 mse = np.sum(elem ** 2 for elem in ΔDiff)
+                if np.isnan(mse):
+                    raise
+
                 if idx % 1000 == 0:
-                    print(f"ite:{idx+1}  Abs Err:{np.abs(Base_Loss - mse)}  x_new:{self.kernel.get_theta()}")
-                
-                if (idx != 1) and (np.abs(Base_Loss - mse) <= self.tol):
-                    break
-                else:
-                    Base_Loss = mse
+                    # print(f"ite:{idx+1}  Abs Err:{np.abs(Base_Loss - mse)}  x_new:{self.kernel.get_theta()}")
+                    print(f"ite:{idx+1}  Abs Err:{mse}  x_new:{self.kernel.get_theta()}")
                 
                 if np.sqrt(mse) <= self.tol:
                     break
