@@ -90,10 +90,10 @@ class Update_RAdam:
         m_hat = self.m / (1 - self.beta1_t)
         ρ_t   = self.ρ_inf - 2 * self.time * self.beta2_t / (1 - self.beta2_t)
 
-        if self.time > 4:
-            l_t = np.sqrt((1 - self.beta2_t) / self.v)
-            r_t = np.sqrt((ρ_t - 4) * (ρ_t - 2) * self.ρ_inf) / np.sqrt((self.ρ_inf - 4) * (self.ρ_inf - 2) * ρ_t)
-            tmp_alpha = self.alpha * r_t * l_t
+        if ρ_t > 4:
+            v_hat = np.sqrt((1 - self.beta2_t) / self.v)
+            r_t   = np.sqrt((ρ_t - 4) * (ρ_t - 2) * self.ρ_inf) / np.sqrt((self.ρ_inf - 4) * (self.ρ_inf - 2) * ρ_t)
+            tmp_alpha = self.alpha * r_t * v_hat
         
         else:
             tmp_alpha = self.alpha
