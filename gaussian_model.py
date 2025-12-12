@@ -187,6 +187,10 @@ class Kernel(metaclass=ABCMeta):
     @abstractmethod
     def get_theta(self) -> Tuple:
         raise NotImplementedError()
+    
+    @abstractmethod
+    def set_theta(self, thetas:Tuple) -> bool:
+        raise NotImplementedError()
 
     @abstractmethod
     def __add__(self, other):
@@ -253,6 +257,10 @@ class ConstantKernel(Kernel):
     def get_theta(self) -> Tuple:
         return (self.alpha,)
 
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        return True
+
     def __add__(self, other):
         if not isinstance(other, Kernel):
             other = ConstantKernel(other)
@@ -305,6 +313,16 @@ class SumKernel(Kernel):
     def get_theta(self) -> Tuple:
         theta_tuple = reduce(lambda x, y: x + y, [elem.get_theta() for elem in self.kernels])
         return theta_tuple
+    
+    def set_theta(self, thetas:Tuple) -> bool:
+        # それぞれの枝における葉ノードのハイパーパラメータの数が不明であるため
+        # これの探索を行う
+        tmp_tuple = thetas
+        for elem in self.kernels:
+            theta_num = len(elem.get_theta())
+            elem.set_theta(tmp_tuple[0:theta_num])
+            tmp_tuple = tmp_tuple[theta_num:]
+        return True
 
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -368,6 +386,12 @@ class WhiteNoiseKernel(Kernel):
         # このことからy=1/2 x^2という変数変換を施す事とした
         tmp_alpha = (self.alpha ** 2) / 2
         return (tmp_alpha,)
+    
+    def set_theta(self, thetas:Tuple) -> bool:
+        if thetas[0] < 0:
+            raise ValueError("The argument must be positive")
+        self.alpha = np.sqrt(thetas[0] * 2)
+        return True
     
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -445,6 +469,94 @@ class GaussKernel(Kernel):
     def get_theta(self) -> Tuple:
         return (self.alpha, self.beta)
     
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        self.beta  = thetas[1]
+        return True
+    
+    def __add__(self, other):
+        if not isinstance(other, Kernel):
+            other = ConstantKernel(other)
+        return SumKernel(self, other)
+
+# 対数ガウスカーネル(Log-RBFカーネル)
+class LogGaussKernel(Kernel):
+    def __init__(self, alpha:float, beta:float, isL1Reg:bool=True, isL2Reg:bool=True, isNonNeg:bool=True):
+        super().__init__()
+        self.alpha     = alpha
+        self.beta      = beta
+        self.isL1Reg   = isL1Reg
+        self.isL2Reg   = isL2Reg
+        self.isNonNeg  = isNonNeg
+        self.cache_mol = np.zeros([1, 1])
+        self.cache_cor = np.zeros([1, 1])
+        return None
+
+    def correlation(self, DATA_X:np.ndarray, DATA_Y:np.ndarray=None) -> np.ndarray:
+        if (type(DATA_X) is not np.ndarray) or (type(DATA_Y) not in {np.ndarray, type(None)}):
+            print(f"type(DATA_X) = {type(DATA_X)}")
+            print(f"type(DATA_Y) = {type(DATA_Y)}")
+            print("エラー：：Numpy型である必要があります。")
+            raise
+
+        if (DATA_X.ndim != 2) or ((type(DATA_Y) != type(None)) and (DATA_Y.ndim != 2)):
+            print(f"DATA_X.ndim = {DATA_X.ndim}")
+            print(f"DATA_Y.ndim = {DATA_Y.ndim}")
+            raise ValueError("エラー：：次元数が一致しません。")
+        
+        # 対称行列であるか判定
+        if np.allclose(DATA_X, DATA_X.T, atol=1e-8) and ((type(DATA_Y) != type(None)) and np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)):
+            print(f"all(DATA_X == DATA_X.T) = {np.allclose(DATA_X, DATA_X.T, atol=1e-8)}")
+            print(f"all(DATA_Y == DATA_Y.T) = {np.allclose(DATA_Y, DATA_Y.T, atol=1e-8)}")
+            raise ValueError("エラー：：対称行列ではありません。")
+        
+        # 前処理として符号付対数変換を行う
+        symmetriclog = lambda x: np.sign(x) * np.log(np.abs(x))
+        if type(DATA_Y) == type(None):
+            self.cache_mol = spd.squareform(spd.pdist(symmetriclog(DATA_X), metric="sqeuclidean"))
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
+        else:
+            self.cache_mol = spd.cdist(DATA_X, DATA_Y, metric="sqeuclidean")
+            self.cache_cor = np.exp(-self.beta * self.cache_mol)
+        
+        return (self.alpha * self.cache_cor)
+    
+    def diff_theta(self) -> Tuple:
+        diff_alpha = self.cache_cor
+        diff_beta  = self.alpha * self.cache_cor * (-self.cache_mol)
+        return (diff_alpha, diff_beta)
+    
+    def update_theta(self, Δtheta:Tuple, eta:Tuple, l1_norm:float=0.0, l2_norm:float=0.0) -> bool:
+        # L1正則化が有効か
+        if self.isL1Reg:
+            Δalpha = soft_threshold(self.alpha + eta[0] * Δtheta[0], eta[0] * l1_norm)
+            Δbeta  = soft_threshold(self.beta  + eta[1] * Δtheta[1], eta[1] * l1_norm)
+        else:
+            Δalpha = self.alpha + eta[0] * Δtheta[0]
+            Δbeta  = self.beta  + eta[1] * Δtheta[1]
+        
+        # L2正則化が有効か
+        if self.isL2Reg:
+            Δalpha = Δalpha / (1 + eta[0] * l2_norm)
+            Δbeta  = Δbeta  / (1 + eta[1] * l2_norm)
+        
+        # 非負制約が有効か
+        if self.isNonNeg:
+            Δalpha = np.maximum(Δalpha, 0)
+            Δbeta  = np.maximum(Δbeta,  0)
+        
+        self.alpha = Δalpha
+        self.beta  = Δbeta
+        return True
+    
+    def get_theta(self) -> Tuple:
+        return (self.alpha, self.beta)
+    
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        self.beta  = thetas[1]
+        return True
+    
     def __add__(self, other):
         if not isinstance(other, Kernel):
             other = ConstantKernel(other)
@@ -509,6 +621,10 @@ class LinearKernel(Kernel):
     
     def get_theta(self) -> Tuple:
         return (self.alpha,)
+    
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        return True
     
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -584,6 +700,11 @@ class ExponentialKernel(Kernel):
     
     def get_theta(self) -> Tuple:
         return (self.alpha, self.beta)
+    
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        self.beta  = thetas[1]
+        return True
     
     def __add__(self, other):
         if not isinstance(other, Kernel):
@@ -667,6 +788,12 @@ class PeriodicKernel(Kernel):
     def get_theta(self) -> Tuple:
         return (self.alpha, self.beta, self.gamma)
     
+    def set_theta(self, thetas:Tuple) -> bool:
+        self.alpha = thetas[0]
+        self.beta  = thetas[1]
+        self.gamma = thetas[2]
+        return True
+    
     def __add__(self, other):
         if not isinstance(other, Kernel):
             other = ConstantKernel(other)
@@ -683,8 +810,7 @@ class Gaussian_Process_Regression:
                  l1_ratio:float=0.1,                 # L1・L2正則化の強さ配分・比率
                  eta:float=1e-5,                     # 学習率η
                  tol:float=1e-8,                     # 許容誤差
-                 max_iterate:int=300000,             # 最大ループ回数
-                 random_state=None) -> None:         # 乱数のシード値
+                 max_iterate:int=300000) -> None:    # 最大ループ回数
         if (type(vec_data_y) is not np.ndarray) or (type(mat_data_x) is not np.ndarray):
             print(f"type(vec_data_y) = {type(vec_data_y)}")
             print(f"type(mat_data_x) = {type(mat_data_x)}")
@@ -708,13 +834,6 @@ class Gaussian_Process_Regression:
         self.tol               = tol
         self.max_iterate       = round(max_iterate)
 
-        self.random_state = random_state
-        if random_state != None:
-            self.random = np.random
-            self.random.seed(seed=self.random_state)
-        else:
-            self.random = np.random
-
 
     def fit(self, solver:str='external library', visible_flg:bool=False, useRAdam:bool=False) -> bool:
         # 本ライブラリにおいてエラーの出力を行わないのは、近似的にでも処理結果が欲しいためである
@@ -727,9 +846,6 @@ class Gaussian_Process_Regression:
         
         x_data = self.mat_data_x
         y_data = self.vec_data_y
-        
-        data_num, expvars = x_data.shape
-        _,        objvars = y_data.shape
         
         # x軸の標準化
         self.x_mean    = np.mean(x_data, axis=0)
@@ -747,8 +863,8 @@ class Gaussian_Process_Regression:
         # 本ライブラリで実装されているアルゴリズムは以下の4点となる
         # ・sklearnライブラリに実装されているGaussianProcessRegressor(外部ライブラリ)
         # ・座標降下法アルゴリズム(CD: Coordinate Descent Algorithm)
-        # ・メジャライザー最適化( ISTA: Iterative Shrinkage soft-Thresholding Algorithm)
-        # ・メジャライザー最適化(FISTA: Fast Iterative Shrinkage soft-Thresholding Algorithm)
+        # ・メジャライザー最適化(ISTA: Iterative Shrinkage soft-Thresholding Algorithm)
+        # ・メジャライザー最適化(ISTA: Iterative Shrinkage soft-Thresholding Algorithm)の亜種
         # これらのアルゴリズムは全て同じ目的関数を最適化している
         # しかし、実際に同一のパラメータでパラメータ探索をさせても同一の解は得られない
         # これは、実装の細かな違いによるものであったり、解析解ではなく近似解が得られるためであったりする
@@ -826,7 +942,7 @@ class Gaussian_Process_Regression:
             # 注意点として、各種正則化・制約の適用有無はカーネル単位で決定されている
             # それはカーネル毎にその性質が全く異なり、一律に適用することができないためである
             # この処理部では、あくまで各種正則化・制約を適用する場合の強度λを決定するのみである
-            # 実装アルゴリズムはメジャライザー最適化(ISTA: Fast Iterative Shrinkage soft-Thresholding Algorithm)の亜種である
+            # 実装アルゴリズムはメジャライザー最適化(ISTA: Iterative Shrinkage soft-Thresholding Algorithm)の亜種である
             # 近接勾配法にオプティマイザとしてRafaelを適用した
             # 収束速度の向上と解の安定性の両面でプレーンなISTAよりも向上している
             # ただし、Rafaelというオプティマイザはアドインテ社員による自作アルゴリズムである
@@ -856,20 +972,19 @@ class Gaussian_Process_Regression:
                 if np.isnan(mse):
                     raise
 
-                if idx % 1000 == 0:
+                if idx % 100 == 0:
                     # print(f"ite:{idx+1}  Abs Err:{np.abs(Base_Loss - mse)}  x_new:{self.kernel.get_theta()}")
                     print(f"ite:{idx+1}  Abs Err:{mse}  x_new:{self.kernel.get_theta()}")
                 
                 if np.sqrt(mse) <= self.tol:
                     break
 
-            self.solver = "FISTA"
+            self.solver = "OPTIMIZER"
             
         else:
             raise
 
-        self.learn_flg = True
-        return self.learn_flg
+        return True
     
     def predict(self, test_X:np.ndarray, return_std:bool=False, return_cov:bool=False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         if return_std and return_cov:
@@ -896,6 +1011,7 @@ class Gaussian_Process_Regression:
         K__    = self.kernel.correlation(x_test)
         y_pred = K_.T @ modcho_solve(K, y_data)
         y_var  = K__ - K_.T @ modcho_solve(K, K_)
+        y_var  = np.maximum(y_var, 0)
 
 
         # y軸の標準化をもとに戻す
