@@ -41,12 +41,17 @@ def modified_cholesky(x:np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     # d = np.diag(d)
     return L, d
 
-# 修正コレスキー分解による連立方程式のソルバー
-def modcho_solve(A:np.ndarray, b:np.ndarray):
-    L, d = modified_cholesky(A)
+# 指定された修正コレスキー分解の因子を用いた連立方程式のソルバー
+def modcho_solve_from_factors(L:np.ndarray, d:np.ndarray, b:np.ndarray):
     z = solve_triangular(L,   b, lower=True,  unit_diagonal=True)
     w = z / d[:, np.newaxis]
     x = solve_triangular(L.T, w, lower=False, unit_diagonal=True)
+    return x
+
+# 修正コレスキー分解による連立方程式のソルバー
+def modcho_solve(A:np.ndarray, b:np.ndarray):
+    L, d = modified_cholesky(A)
+    x    = modcho_solve_from_factors(L, d, b)
     return x
 
 # 軟判別閾値関数
@@ -835,7 +840,7 @@ class Gaussian_Process_Regression:
         self.max_iterate       = round(max_iterate)
 
 
-    def fit(self, solver:str='external library', visible_flg:bool=False, useRAdam:bool=False) -> bool:
+    def fit(self, solver:str='external library', visible_flg:bool=False, useRAdam:bool=False, dryRun:bool=False) -> bool:
         # 本ライブラリにおいてエラーの出力を行わないのは、近似的にでも処理結果が欲しいためである
         # また、solverとしてISTA・FISTAを使用する際にも注意が必要である
         # ISTA・FISTAは勾配降下法に似た特徴を有しており、対象の最適化パラメータのスケールに弱い
@@ -858,6 +863,37 @@ class Gaussian_Process_Regression:
         self.y_std_dev = np.std( y_data, axis=0)
         self.y_std_dev[self.y_std_dev < 1e-32] = 1
         y_data = (y_data - self.y_mean) / self.y_std_dev
+
+
+        # メモ：
+        # ガウス過程回帰というアルゴリズムの計算量はデータ数Nに対してO(N^3)である
+        # データ数が100点程度であれば、何の問題もなく動作させることが可能である
+        # しかし、実案件に適用する場合には1万点を超えるようなケースが多々存在する
+        # そのため、事前に学習しておいたハイパーパラメータのまま予測を行うようにすることで
+        # ・学習プロセス
+        # ・予測プロセス
+        # 上記二つのプロセスを分離することとした
+        # 予測プロセス時には、この関数を呼ばれても予測に必要な最低限の計算しか行わないようにした
+        if dryRun == True:
+            if   solver == "external library":
+                self.model = GaussianProcessRegressor(
+                                    kernel=(kernels.ConstantKernel()   * kernels.DotProduct()
+                                            + kernels.ConstantKernel() * kernels.Matern(nu=0.5)
+                                            + kernels.ConstantKernel() * kernels.ExpSineSquared()
+                                            + kernels.ConstantKernel() * kernels.RBF()
+                                            + kernels.ConstantKernel() * kernels.WhiteKernel()), 
+                                    alpha=self.tol, random_state=0)
+                self.model.fit(self.mat_data_x, self.vec_data_y)
+                self.solver = "external library"
+
+            else:
+                # キャッシュの計算
+                cache_K                    = self.kernel.correlation(x_data)
+                self.cache_L, self.cache_d = modified_cholesky(cache_K)
+                self.cache_W               = modcho_solve_from_factors(self.cache_L, self.cache_d, y_data)
+                self.solver = "dry run"
+            
+            return True
             
         
         # 本ライブラリで実装されているアルゴリズムは以下の4点となる
@@ -903,7 +939,7 @@ class Gaussian_Process_Regression:
                                         + kernels.ConstantKernel() * kernels.ExpSineSquared()
                                         + kernels.ConstantKernel() * kernels.RBF()
                                         + kernels.ConstantKernel() * kernels.WhiteKernel()), 
-                                alpha=1e-8, random_state=0)
+                                alpha=self.tol, random_state=0)
             self.model.fit(self.mat_data_x, self.vec_data_y)
             self.solver = "external library"
 
@@ -984,6 +1020,11 @@ class Gaussian_Process_Regression:
         else:
             raise
 
+        # キャッシュの計算
+        cache_K                    = self.kernel.correlation(x_data)
+        self.cache_L, self.cache_d = modified_cholesky(cache_K)
+        self.cache_W               = modcho_solve_from_factors(self.cache_L, self.cache_d, y_data)
+
         return True
     
     def predict(self, test_X:np.ndarray, return_std:bool=False, return_cov:bool=False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
@@ -995,22 +1036,19 @@ class Gaussian_Process_Regression:
             return res
 
         x_data = self.mat_data_x
-        y_data = self.vec_data_y
         x_test = test_X
 
         # x軸の標準化
         x_data = (x_data - self.x_mean) / self.x_std_dev
         x_test = (x_test - self.x_mean) / self.x_std_dev
-        # y軸の標準化
-        y_data = (y_data - self.y_mean) / self.y_std_dev
         
 
         # 予測平均・予測分散の算出
-        K      = self.kernel.correlation(x_data)
         K_     = self.kernel.correlation(x_data, x_test)
         K__    = self.kernel.correlation(x_test)
-        y_pred = K_.T @ modcho_solve(K, y_data)
-        y_var  = K__ - K_.T @ modcho_solve(K, K_)
+        V      = modcho_solve_from_factors(self.cache_L, self.cache_d, K_)
+        y_pred = K_.T @ self.cache_W
+        y_var  = np.diag(K__) - np.sum(K_ * V, axis=0)
         y_var  = np.maximum(y_var, 0)
 
 
@@ -1022,7 +1060,6 @@ class Gaussian_Process_Regression:
             return y_pred, y_var
         elif return_std:
             y_std = np.sqrt(y_var)
-            y_std = np.diag(y_std)
             return y_pred, y_std
         else:
             return y_pred
